@@ -1,0 +1,6 @@
+fastapi
+kafka-python
+pydantic
+pyspark
+redis
+requests
