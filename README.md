@@ -16,11 +16,11 @@ An end-to-end realtime analytics system that ingests user events via HTTP, strea
                                                  └──────────────┘
 ```
 
-**Write path:** Events are POSTed to the FastAPI ingestion service, validated against a Pydantic schema, and published to a Kafka topic.
+**Write path:** Events are POSTed to the FastAPI ingestion service, validated against a Pydantic schema, and routed to per-event-type Kafka topics (e.g. `events.click`, `events.page_view`).
 
-**Compute path:** A PySpark Structured Streaming job consumes from Kafka in micro-batches, computes both all-time and 1-minute windowed aggregations, and writes results to Redis (hashes, sorted sets, HyperLogLog for unique user counts).
+**Compute path:** A PySpark Structured Streaming job subscribes to all `events.*` topics via a regex pattern, processes micro-batches, and writes both all-time and 1-minute windowed aggregations plus cross-dimensional breakdowns to Redis (hashes, sorted sets, HyperLogLog for unique user counts).
 
-**Read path:** The FastAPI service also exposes analytics endpoints that read pre-aggregated data from Redis. The Next.js dashboard polls these endpoints and renders live charts and stats.
+**Read path:** The FastAPI service exposes summary and drill-down analytics endpoints that read pre-aggregated data from Redis. The Next.js dashboard polls these endpoints and renders live charts, stats, and an interactive drill-down explorer.
 
 ## Project Structure
 
@@ -83,10 +83,22 @@ uvicorn ingestion-service:app --reload
 
 The API will be available at `http://localhost:8000`. Key endpoints:
 
-- `POST /event` — send a single event
-- `POST /events/batch` — send a batch of events
-- `GET /analytics/summary` — full dashboard payload
-- `GET /analytics/event-counts`, `/analytics/unique-users`, `/analytics/top-pages`, `/analytics/devices`, `/analytics/error-rate`, `/analytics/events-per-user`
+| Method | Endpoint | Description |
+| ------ | -------- | ----------- |
+| `GET` | `/health` | Health check (Kafka + Redis connectivity) |
+| `POST` | `/event` | Send a single event |
+| `POST` | `/events/batch` | Send a batch of events |
+| `GET` | `/analytics/summary` | Full dashboard payload |
+| `GET` | `/analytics/event-counts` | All-time counts by event type |
+| `GET` | `/analytics/unique-users` | Unique users per 1-min window |
+| `GET` | `/analytics/top-pages` | Top pages by hit count |
+| `GET` | `/analytics/devices` | Device breakdown |
+| `GET` | `/analytics/error-rate` | Error rate per 1-min window |
+| `GET` | `/analytics/events-per-user` | Events per user (sorted) |
+| `GET` | `/analytics/filters` | Available filter values (pages, users, devices) |
+| `GET` | `/analytics/filter/page?url=` | Drill-down by page |
+| `GET` | `/analytics/filter/user?id=` | Drill-down by user |
+| `GET` | `/analytics/filter/device?type=` | Drill-down by device |
 
 ### 4. Start the Spark streaming job
 
@@ -139,14 +151,30 @@ python simulator.py --burst 500
 
 Supported event types: `click`, `page_view`, `scroll`, `form_submit`, `error`, `logout`, `signup`, `purchase`.
 
+## Configuration
+
+All services support configuration via environment variables (or a `.env` file in the project root via `python-dotenv`):
+
+| Variable | Default | Used By |
+| -------- | ------- | ------- |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | ingestion-service, Spark |
+| `KAFKA_TOPIC_PREFIX` | `events` | ingestion-service, Spark |
+| `REDIS_HOST` | `localhost` | ingestion-service, Spark |
+| `REDIS_PORT` | `6379` | ingestion-service, Spark |
+| `API_URL` | `http://localhost:8000/event` | simulator |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | dashboard |
+
 ## Analytics Computed
 
-| Metric                   | Type             | Redis Structure |
-| ------------------------ | ---------------- | --------------- |
-| Event counts by type     | All-time         | Hash            |
-| Events per user          | All-time         | Hash            |
-| Top pages by hits        | All-time         | Sorted Set      |
-| Device breakdown         | All-time         | Hash            |
-| Unique users per window  | 1-min windowed   | HyperLogLog     |
-| Error rate per window    | 1-min windowed   | Hash            |
-| Throughput per event type| 1-min windowed   | String (counter)|
+| Metric                    | Type           | Redis Structure |
+| ------------------------- | -------------- | --------------- |
+| Event counts by type      | All-time       | Hash            |
+| Events per user           | All-time       | Hash            |
+| Top pages by hits         | All-time       | Sorted Set      |
+| Device breakdown          | All-time       | Hash            |
+| Per-page event & device   | All-time       | Hash            |
+| Per-user event, device & page | All-time   | Hash            |
+| Per-device event & page   | All-time       | Hash            |
+| Unique users per window   | 1-min windowed | HyperLogLog     |
+| Error rate per window     | 1-min windowed | Hash            |
+| Throughput per event type | 1-min windowed | String (counter)|

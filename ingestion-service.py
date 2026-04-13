@@ -1,11 +1,23 @@
+import json
+import os
 from functools import lru_cache
-from schema import Event
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
-import json
 import redis
+
+from schema import Event
+
+load_dotenv()
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC_PREFIX = os.getenv("KAFKA_TOPIC_PREFIX", "events")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 app = FastAPI()
 
@@ -16,16 +28,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
+_redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
 @lru_cache(maxsize=1)
 def get_producer() -> KafkaProducer:
     return KafkaProducer(
-        bootstrap_servers=["localhost:9092"],
+        bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
     )
 
+
+def _topic_for(event_type: str) -> str:
+    return f"{KAFKA_TOPIC_PREFIX}.{event_type}"
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health_check():
+    checks: dict[str, str] = {}
+    healthy = True
+
+    try:
+        _redis.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {e}"
+        healthy = False
+
+    try:
+        get_producer()
+        checks["kafka"] = "ok"
+    except Exception as e:
+        checks["kafka"] = f"error: {e}"
+        healthy = False
+
+    return JSONResponse(
+        content={"status": "healthy" if healthy else "unhealthy", **checks},
+        status_code=200 if healthy else 503,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ingestion endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/event")
 async def send_event(event: Event):
@@ -34,11 +83,12 @@ async def send_event(event: Event):
     except KafkaError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot reach Kafka at localhost:9092 ({e}). Run: docker compose up -d",
+            detail=f"Cannot reach Kafka at {KAFKA_BOOTSTRAP_SERVERS} ({e}). "
+                   "Run: docker compose up -d",
         ) from e
-    producer.send("events", value=event.model_dump())
+    producer.send(_topic_for(event.event_type), value=event.model_dump())
     producer.flush(timeout=10)
-    return {"status": "sent"}
+    return {"status": "sent", "topic": _topic_for(event.event_type)}
 
 
 @app.post("/events/batch")
@@ -48,10 +98,11 @@ async def send_events_batch(events: list[Event]):
     except KafkaError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot reach Kafka at localhost:9092 ({e}). Run: docker compose up -d",
+            detail=f"Cannot reach Kafka at {KAFKA_BOOTSTRAP_SERVERS} ({e}). "
+                   "Run: docker compose up -d",
         ) from e
     for event in events:
-        producer.send("events", value=event.model_dump())
+        producer.send(_topic_for(event.event_type), value=event.model_dump())
     producer.flush(timeout=10)
     return {"status": "sent", "count": len(events)}
 
@@ -118,6 +169,75 @@ async def get_events_per_user(limit: int = 20):
     all_users = _redis.hgetall("events_per_user")
     sorted_users = sorted(all_users.items(), key=lambda x: int(x[1]), reverse=True)
     return [{"user_id": uid, "total": int(cnt)} for uid, cnt in sorted_users[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Filtered / drill-down analytics
+# ---------------------------------------------------------------------------
+
+def _int_hash(raw: dict[str, str]) -> dict[str, int]:
+    return {k: int(v) for k, v in raw.items()}
+
+
+def _sorted_pairs(raw: dict[str, str], limit: int = 20) -> list[dict]:
+    pairs = sorted(raw.items(), key=lambda x: int(x[1]), reverse=True)
+    return [{"name": k, "count": int(v)} for k, v in pairs[:limit]]
+
+
+@app.get("/analytics/filters")
+async def get_filter_options():
+    """Available values for each filterable dimension."""
+    pages = _redis.zrevrange("top_pages", 0, -1)
+    users = list(_redis.hgetall("events_per_user").keys())
+    devices = list(_redis.hgetall("device_counts").keys())
+    return {"pages": pages, "users": sorted(users), "devices": sorted(devices)}
+
+
+@app.get("/analytics/filter/page")
+async def filter_by_page(url: str):
+    events = _redis.hgetall(f"page_events:{url}")
+    devices = _redis.hgetall(f"page_devices:{url}")
+    if not events and not devices:
+        raise HTTPException(404, detail=f"No data for page {url}")
+    total = sum(int(v) for v in events.values()) if events else 0
+    return {
+        "page_url": url,
+        "total_hits": total,
+        "events": _int_hash(events),
+        "devices": _int_hash(devices),
+    }
+
+
+@app.get("/analytics/filter/user")
+async def filter_by_user(id: str):
+    events = _redis.hgetall(f"user_events:{id}")
+    devices = _redis.hgetall(f"user_devices:{id}")
+    pages = _redis.hgetall(f"user_pages:{id}")
+    if not events and not devices and not pages:
+        raise HTTPException(404, detail=f"No data for user {id}")
+    total = sum(int(v) for v in events.values()) if events else 0
+    return {
+        "user_id": id,
+        "total_events": total,
+        "events": _int_hash(events),
+        "devices": _int_hash(devices),
+        "pages": _sorted_pairs(pages),
+    }
+
+
+@app.get("/analytics/filter/device")
+async def filter_by_device(type: str):
+    events = _redis.hgetall(f"device_events:{type}")
+    pages = _redis.hgetall(f"device_pages:{type}")
+    if not events and not pages:
+        raise HTTPException(404, detail=f"No data for device {type}")
+    total = sum(int(v) for v in events.values()) if events else 0
+    return {
+        "device": type,
+        "total_events": total,
+        "events": _int_hash(events),
+        "pages": _sorted_pairs(pages),
+    }
 
 
 @app.get("/analytics/summary")

@@ -24,15 +24,19 @@ python simulator.py --eps 200 --workers 16 --url http://myhost:8000/event
 """
 
 import argparse
+import os
 import random
 import time
 import uuid
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from dotenv import load_dotenv
 import requests
 
-API_URL = "http://localhost:8000/event"
+load_dotenv()
+
+API_URL = os.getenv("API_URL", "http://localhost:8000/event")
 
 EVENT_TYPES = ["click", "page_view", "scroll", "form_submit", "error", "logout", "signup", "purchase"]
 PAGES = ["/home", "/products", "/products/1", "/products/2", "/cart", "/checkout",
@@ -45,9 +49,9 @@ EVENT_WEIGHTS = [30, 25, 15, 8, 5, 4, 3, 10]
 def make_user_pool(n: int) -> list[dict]:
     """Pre-generate a pool of users with sticky sessions and devices."""
     users = []
-    for _ in range(n):
+    for i in range(1, n + 1):
         users.append({
-            "user_id": f"user-{uuid.uuid4().hex[:8]}",
+            "user_id": f"user-{i}",
             "session_id": uuid.uuid4().hex,
             "device": random.choices(DEVICES, weights=DEVICE_WEIGHTS, k=1)[0],
             "ip_address": f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",

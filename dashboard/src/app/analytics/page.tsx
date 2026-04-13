@@ -21,6 +21,20 @@ interface Summary {
   error_timeline: { window: string; total: number; errors: number; rate: number }[];
 }
 
+interface FilterOptions {
+  pages: string[];
+  users: string[];
+  devices: string[];
+}
+
+interface FilterResult {
+  total_hits?: number;
+  total_events?: number;
+  events?: Record<string, number>;
+  devices?: Record<string, number>;
+  pages?: { name: string; count: number }[];
+}
+
 function StatCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
     <div className="bg-card border border-border rounded-xl p-5">
@@ -53,18 +67,29 @@ function shortTime(iso: string) {
   }
 }
 
+type Dimension = "page" | "user" | "device";
+
 export default function AnalyticsDashboard() {
   const [data, setData] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshRate, setRefreshRate] = useState(5);
   const [lastUpdated, setLastUpdated] = useState<string>("");
 
+  const [filterOpts, setFilterOpts] = useState<FilterOptions | null>(null);
+  const [dimension, setDimension] = useState<Dimension>("page");
+  const [filterValue, setFilterValue] = useState<string>("");
+  const [filterResult, setFilterResult] = useState<FilterResult | null>(null);
+  const [filterLoading, setFilterLoading] = useState(false);
+
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/analytics/summary`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json: Summary = await res.json();
-      setData(json);
+      const [summaryRes, filtersRes] = await Promise.all([
+        fetch(`${API}/analytics/summary`),
+        fetch(`${API}/analytics/filters`),
+      ]);
+      if (!summaryRes.ok) throw new Error(`HTTP ${summaryRes.status}`);
+      setData(await summaryRes.json());
+      if (filtersRes.ok) setFilterOpts(await filtersRes.json());
       setLastUpdated(new Date().toLocaleTimeString());
     } catch {
       /* keep stale data on error */
@@ -78,6 +103,25 @@ export default function AnalyticsDashboard() {
     const id = setInterval(fetchData, refreshRate * 1000);
     return () => clearInterval(id);
   }, [fetchData, refreshRate]);
+
+  useEffect(() => {
+    setFilterValue("");
+    setFilterResult(null);
+  }, [dimension]);
+
+  const fetchFilter = useCallback(async (dim: Dimension, val: string) => {
+    if (!val) { setFilterResult(null); return; }
+    setFilterLoading(true);
+    try {
+      const param = dim === "page" ? `url=${encodeURIComponent(val)}`
+        : dim === "user" ? `id=${encodeURIComponent(val)}`
+        : `type=${encodeURIComponent(val)}`;
+      const res = await fetch(`${API}/analytics/filter/${dim}?${param}`);
+      if (res.ok) setFilterResult(await res.json());
+      else setFilterResult(null);
+    } catch { setFilterResult(null); }
+    finally { setFilterLoading(false); }
+  }, []);
 
   if (loading && !data)
     return (
@@ -145,6 +189,129 @@ export default function AnalyticsDashboard() {
           sub={`Max: ${data.user_stats.max_events_per_user}`}
         />
       </div>
+
+      {/* Drill-down filter */}
+      {filterOpts && (
+        <div className="bg-card border border-border rounded-xl p-5 mb-8">
+          <h2 className="font-semibold text-sm text-muted uppercase tracking-wider mb-4">
+            Drill-Down Explorer
+          </h2>
+
+          <div className="flex flex-wrap items-end gap-3 mb-5">
+            <div>
+              <label className="block text-xs text-muted mb-1">Dimension</label>
+              <div className="flex rounded-lg border border-border overflow-hidden text-sm">
+                {(["page", "user", "device"] as Dimension[]).map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setDimension(d)}
+                    className={`px-4 py-1.5 capitalize transition-colors ${
+                      dimension === d ? "bg-accent text-white" : "bg-card hover:bg-background"
+                    }`}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 min-w-[200px]">
+              <label className="block text-xs text-muted mb-1">
+                Select {dimension}
+              </label>
+              <select
+                value={filterValue}
+                onChange={(e) => {
+                  setFilterValue(e.target.value);
+                  fetchFilter(dimension, e.target.value);
+                }}
+                className="w-full rounded-lg border border-border bg-background px-3 py-1.5 text-sm"
+              >
+                <option value="">— choose —</option>
+                {(dimension === "page"
+                  ? filterOpts.pages
+                  : dimension === "user"
+                  ? filterOpts.users
+                  : filterOpts.devices
+                ).map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {filterLoading && (
+            <p className="text-sm text-muted italic">Loading…</p>
+          )}
+
+          {filterResult && !filterLoading && (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {/* Events breakdown */}
+              {filterResult.events && Object.keys(filterResult.events).length > 0 && (
+                <div>
+                  <h3 className="text-xs font-semibold text-muted uppercase mb-2">Events</h3>
+                  <div className="space-y-1.5">
+                    {Object.entries(filterResult.events)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([t, c]) => (
+                        <Bar
+                          key={t}
+                          label={t}
+                          value={c}
+                          max={Math.max(...Object.values(filterResult.events!), 1)}
+                        />
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Devices breakdown */}
+              {filterResult.devices && Object.keys(filterResult.devices).length > 0 && (
+                <div>
+                  <h3 className="text-xs font-semibold text-muted uppercase mb-2">Devices</h3>
+                  <div className="space-y-1.5">
+                    {Object.entries(filterResult.devices)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([d, c]) => (
+                        <Bar
+                          key={d}
+                          label={d}
+                          value={c}
+                          max={Math.max(...Object.values(filterResult.devices!), 1)}
+                          color="bg-violet-500"
+                        />
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Pages breakdown */}
+              {filterResult.pages && filterResult.pages.length > 0 && (
+                <div>
+                  <h3 className="text-xs font-semibold text-muted uppercase mb-2">Pages</h3>
+                  <div className="space-y-1.5">
+                    {filterResult.pages.map((p) => (
+                      <Bar
+                        key={p.name}
+                        label={p.name}
+                        value={p.count}
+                        max={filterResult.pages![0].count || 1}
+                        color="bg-emerald-500"
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!filterResult && !filterLoading && filterValue && (
+            <p className="text-sm text-muted italic">No data found for this selection.</p>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
         {/* Event breakdown */}
@@ -220,19 +387,19 @@ export default function AnalyticsDashboard() {
         {data.throughput_timeline.length === 0 ? (
           <p className="text-sm text-muted italic">No windowed data yet</p>
         ) : (
-          <div className="flex items-end gap-1 h-40 overflow-x-auto pb-6 relative">
+          <div className="flex items-stretch gap-1 h-48 overflow-x-auto pb-8 relative">
             {data.throughput_timeline.map((t) => {
               const pct = (t.total / maxThroughput) * 100;
               return (
-                <div key={t.window} className="flex flex-col items-center flex-shrink-0 group" style={{ minWidth: 48 }}>
-                  <span className="text-[10px] font-mono text-muted opacity-0 group-hover:opacity-100 transition-opacity mb-1">
+                <div key={t.window} className="flex flex-col items-center justify-end flex-shrink-0 group" style={{ minWidth: 48 }}>
+                  <span className="text-[10px] font-mono text-muted mb-1">
                     {t.total}
                   </span>
                   <div
                     className="w-8 bg-accent rounded-t transition-all duration-500 hover:bg-accent-hover"
-                    style={{ height: `${Math.max(pct, 2)}%` }}
+                    style={{ height: `${Math.max(pct, 4)}%` }}
                   />
-                  <span className="text-[10px] font-mono text-muted mt-1 rotate-[-45deg] origin-top-left absolute bottom-0 translate-y-3">
+                  <span className="text-[10px] font-mono text-muted mt-1 rotate-[-45deg] origin-top-left whitespace-nowrap">
                     {shortTime(t.window)}
                   </span>
                 </div>
