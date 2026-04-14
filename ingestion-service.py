@@ -18,6 +18,8 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC_PREFIX = os.getenv("KAFKA_TOPIC_PREFIX", "events")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+DYNAMODB_SNAPSHOTS_TABLE = os.getenv("DYNAMODB_SNAPSHOTS_TABLE", "")
 
 app = FastAPI()
 
@@ -238,6 +240,48 @@ async def filter_by_device(type: str):
         "events": _int_hash(events),
         "pages": _sorted_pairs(pages),
     }
+
+
+@app.get("/analytics/history")
+async def get_history(
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 60,
+):
+    """Query historical metric snapshots from DynamoDB by time range."""
+    if not DYNAMODB_SNAPSHOTS_TABLE:
+        raise HTTPException(status_code=404, detail="DynamoDB snapshots not configured")
+
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    import boto3
+    from boto3.dynamodb.conditions import Key
+
+    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    sk_start = start or "2000-01-01T00:00:00"
+    sk_end = end or now_iso
+
+    table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DYNAMODB_SNAPSHOTS_TABLE)
+    resp = table.query(
+        KeyConditionExpression=(
+            Key("pk").eq("snapshot") & Key("sk").between(sk_start, sk_end)
+        ),
+        ScanIndexForward=False,
+        Limit=limit,
+    )
+
+    def _decimal_to_num(obj):
+        if isinstance(obj, Decimal):
+            return int(obj) if obj == int(obj) else float(obj)
+        if isinstance(obj, dict):
+            return {k: _decimal_to_num(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_decimal_to_num(i) for i in obj]
+        return obj
+
+    snapshots = [_decimal_to_num(item) for item in resp.get("Items", [])]
+    return {"snapshots": snapshots, "count": len(snapshots)}
 
 
 @app.get("/analytics/summary")

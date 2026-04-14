@@ -8,30 +8,40 @@ An end-to-end realtime analytics system that ingests user events via HTTP, strea
 ┌──────────────┐     ┌──────────────────┐     ┌─────────┐     ┌──────────────────┐     ┌───────┐
 │  Browser /   │────▶│  Ingestion API   │────▶│  Kafka  │────▶│  Spark Streaming │────▶│ Redis │
 │  Simulator   │     │  (FastAPI)       │     │         │     │  (PySpark)       │     │       │
-└──────────────┘     └──────────────────┘     └─────────┘     └──────────────────┘     └───┬───┘
-                              ▲                                                            │
-                              │                  ┌──────────────┐                          │
-                              └──────────────────│  Dashboard   │◀─────────────────────────┘
+└──────────────┘     └──────────────────┘     └─────────┘     └────────┬─────────┘     └───┬───┘
+                              ▲                                        │                    │
+                              │                                  ┌─────▼──────┐             │
+                              │                                  │ S3 Archive │             │
+                              │                                  │ (Parquet)  │             │
+                              │                                  └────────────┘             │
+                              │                                        │                    │
+                              │                                  ┌─────▼──────┐             │
+                              │                                  │  DynamoDB  │             │
+                              │                                  │ (Snapshots)│             │
+                              │                                  └─────┬──────┘             │
+                              │                  ┌──────────────┐      │                    │
+                              └──────────────────│  Dashboard   │◀─────┴────────────────────┘
                                  GET /analytics  │  (Next.js)   │  reads aggregates via API
                                                  └──────────────┘
 ```
 
 **Write path:** Events are POSTed to the FastAPI ingestion service, validated against a Pydantic schema, and routed to per-event-type Kafka topics (e.g. `events.click`, `events.page_view`).
 
-**Compute path:** A PySpark Structured Streaming job subscribes to all `events.*` topics via a regex pattern, processes micro-batches, and writes both all-time and 1-minute windowed aggregations plus cross-dimensional breakdowns to Redis (hashes, sorted sets, HyperLogLog for unique user counts).
+**Compute path:** A PySpark Structured Streaming job subscribes to all `events.*` topics via a regex pattern, processes micro-batches, and writes both all-time and 1-minute windowed aggregations plus cross-dimensional breakdowns to Redis. Optionally, each batch is also archived to S3 as Parquet (partitioned by event type and date) and a point-in-time metric snapshot is written to DynamoDB.
 
-**Read path:** The FastAPI service exposes summary and drill-down analytics endpoints that read pre-aggregated data from Redis. The Next.js dashboard polls these endpoints and renders live charts, stats, and an interactive drill-down explorer.
+**Read path:** The FastAPI service exposes summary, drill-down, and historical analytics endpoints. Live metrics come from Redis; historical snapshots are queried from DynamoDB. The Next.js dashboard polls these endpoints and renders live charts, stats, and an interactive drill-down explorer.
 
 ## Project Structure
 
 ```
+├── .env.example             # Environment variable template
 ├── docker-compose.yml       # Kafka (KRaft), Redis, Kafka UI
 ├── requirements.txt         # Python dependencies
 ├── schema.py                # Pydantic Event model
 ├── ingestion-service.py     # FastAPI — event ingestion + analytics API
 ├── simulator.py             # Load generator for synthetic traffic
 ├── spark-job/
-│   └── streaming.py         # PySpark Structured Streaming job
+│   └── streaming.py         # PySpark Structured Streaming + S3/DynamoDB
 └── dashboard/               # Next.js frontend
     └── src/app/
         ├── page.tsx         # Event Sender UI
@@ -47,8 +57,9 @@ An end-to-end realtime analytics system that ingests user events via HTTP, strea
 | Messaging   | Apache Kafka 3.9 (KRaft mode, single broker) |
 | Processing  | PySpark Structured Streaming                  |
 | Storage     | Redis 7 (hashes, sorted sets, HyperLogLog)   |
+| Archive     | Amazon S3 (Parquet), DynamoDB (snapshots)     |
 | Frontend    | Next.js 16, React 19, Tailwind CSS 4          |
-| Tooling     | Docker Compose, OpenJDK 17                    |
+| Tooling     | Docker Compose, OpenJDK 17, boto3             |
 
 ## Prerequisites
 
@@ -99,6 +110,7 @@ The API will be available at `http://localhost:8000`. Key endpoints:
 | `GET` | `/analytics/filter/page?url=` | Drill-down by page |
 | `GET` | `/analytics/filter/user?id=` | Drill-down by user |
 | `GET` | `/analytics/filter/device?type=` | Drill-down by device |
+| `GET` | `/analytics/history?start=&end=&limit=` | Historical snapshots from DynamoDB |
 
 ### 4. Start the Spark streaming job
 
@@ -161,8 +173,13 @@ All services support configuration via environment variables (or a `.env` file i
 | `KAFKA_TOPIC_PREFIX` | `events` | ingestion-service, Spark |
 | `REDIS_HOST` | `localhost` | ingestion-service, Spark |
 | `REDIS_PORT` | `6379` | ingestion-service, Spark |
+| `S3_ARCHIVE_BUCKET` | *(empty — disabled)* | Spark |
+| `AWS_REGION` | `us-east-1` | ingestion-service, Spark |
+| `DYNAMODB_SNAPSHOTS_TABLE` | *(empty — disabled)* | ingestion-service, Spark |
 | `API_URL` | `http://localhost:8000/event` | simulator |
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | dashboard |
+
+Copy `.env.example` to `.env` and fill in any values you need. S3 archiving and DynamoDB snapshots are **opt-in** — they activate only when their respective env vars are set to non-empty values.
 
 ## Analytics Computed
 
@@ -178,3 +195,10 @@ All services support configuration via environment variables (or a `.env` file i
 | Unique users per window   | 1-min windowed | HyperLogLog     |
 | Error rate per window     | 1-min windowed | Hash            |
 | Throughput per event type | 1-min windowed | String (counter)|
+
+### Optional AWS Persistence
+
+When configured, the Spark job additionally:
+
+- **S3 Archive** — writes every raw event batch to `s3://<bucket>/raw-events/` as Parquet, partitioned by `event_type` and `date` for efficient querying with Athena or Spark batch jobs.
+- **DynamoDB Snapshots** — writes a point-in-time summary (total events, unique users, error rate, breakdowns) to a DynamoDB table after each micro-batch with a 7-day TTL. These snapshots power the `GET /analytics/history` endpoint.
